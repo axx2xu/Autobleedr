@@ -1,0 +1,191 @@
+/* IR LED + Phototransistor (direct) — ESP32 / Arduino IDE
+ * Technique: LED ON/OFF "chopping" and differencing to reject ambient.
+ * Features: auto-baseline, noise-based threshold, hysteresis, debounce, prints.
+ *
+ * Wire-up (example):
+ *   - IR LED anode -> IR_LED_PIN (through series resistor!) ; cathode -> GND
+ *   - Phototransistor collector -> 3V3, emitter -> SENSOR_PIN with pull-down (or emitter to GND with pull-up; adjust wiring as needed)
+ *   - SENSOR_PIN -> ADC input (use one of ADC1 pins; below uses GPIO34)
+ *   - Optional: STATUS_LED_PIN to see detections (built-in LED on many boards is GPIO2)
+ */
+
+// -------------------- USER PINS (EDIT THESE) --------------------
+#define IR_LED_PIN        25   // your GPIO driving the IR LED (with series resistor)
+#define SENSOR_PIN        34   // ADC1 pin (e.g., 32, 33, 34, 35, 36, 39). 34 is input-only (good).
+#define STATUS_LED_PIN     2   // on-board LED on many ESP32 dev boards (optional)
+
+// -------------------- TUNABLES --------------------
+const uint8_t  ADC_BITS               = 12;          // ESP32 ADC native is 12-bit
+const adc_attenuation_t ADC_ATTEN     = ADC_11db;    // Wider input range (approx up to ~3.3 V)
+const uint16_t LED_SETTLE_US          = 200;         // Wait after toggling LED before sampling
+const uint8_t  SAMPLES_PER_PHASE      = 8;           // Number of ADC reads per ON and OFF phase
+const uint16_t CAL_TIME_MS            = 3000;        // Auto-calibration duration at startup
+const float    THRESH_NOISE_MULT      = 6.0f;        // Threshold = baseline + k * sigma
+const uint16_t THRESH_MIN_MARGIN      = 40;          // Minimum extra margin (ADC counts) above baseline
+const uint16_t HYSTERESIS_COUNTS      = 20;          // Hysteresis band (ADC counts)
+const uint8_t  DEBOUNCE_HITS_REQUIRED = 3;           // consecutive frames above threshold to confirm detection
+const uint8_t  DEBOUNCE_CLEAR_REQUIRED= 3;           // consecutive frames below (threshold - hyst) to clear
+const uint16_t LOOP_PERIOD_MS         = 5;           // Main loop cadence (~200 Hz)
+
+// -------------------- RUNTIME STATE --------------------
+float    baseline = 0.0f;     // mean of differenced signal at idle
+float    noiseStd = 5.0f;     // estimated stdev of differenced noise
+uint16_t thresh   = 0;        // absolute threshold (ADC counts)
+bool     detected = false;
+uint8_t  hitCount = 0;
+uint8_t  clearCount = 0;
+
+// Simple EMA (exponential moving average) for smoothing the differenced signal
+const float EMA_ALPHA = 0.25f;
+float emaDiff = 0.0f;
+
+// -------------------- HELPERS --------------------
+uint16_t readADC() {
+  // Plain analogRead; returns 0..4095 at 12-bit
+  return analogRead(SENSOR_PIN);
+}
+
+// Return ambient-cancelled signal: avg(ADC with LED ON) - avg(ADC with LED OFF)
+int16_t readDifferenced() {
+  // LED ON phase
+  digitalWrite(IR_LED_PIN, HIGH);
+  delayMicroseconds(LED_SETTLE_US);
+  uint32_t sumOn = 0;
+  for (uint8_t i = 0; i < SAMPLES_PER_PHASE; ++i) {
+    sumOn += readADC();
+  }
+  // LED OFF phase
+  digitalWrite(IR_LED_PIN, LOW);
+  delayMicroseconds(LED_SETTLE_US);
+  uint32_t sumOff = 0;
+  for (uint8_t i = 0; i < SAMPLES_PER_PHASE; ++i) {
+    sumOff += readADC();
+  }
+  int32_t avgOn  = (int32_t)(sumOn  / SAMPLES_PER_PHASE);
+  int32_t avgOff = (int32_t)(sumOff / SAMPLES_PER_PHASE);
+  return (int16_t)(avgOn - avgOff);
+}
+
+void computeThreshold() {
+  // Threshold is baseline + max(k*sigma, THRESH_MIN_MARGIN)
+  float margin = max(THRESH_NOISE_MULT * noiseStd, (float)THRESH_MIN_MARGIN);
+  float t = baseline + margin;
+  if (t < 0) t = 0;
+  if (t > 4095) t = 4095;
+  thresh = (uint16_t)t;
+}
+
+void autoCalibrate() {
+  const uint32_t tStart = millis();
+  const uint16_t reserve = 16; // ensure enough samples for std calc
+  // Welford running mean/variance
+  uint32_t n = 0;
+  double mean = 0.0;
+  double M2 = 0.0;
+
+  while ((millis() - tStart) < CAL_TIME_MS) {
+    int16_t d = readDifferenced();
+    n++;
+    double x = (double)d;
+    double delta = x - mean;
+    mean += delta / (double)n;
+    double delta2 = x - mean;
+    M2 += delta * delta2;
+
+    // Modest pacing
+    delay(LOOP_PERIOD_MS);
+  }
+
+  if (n > 1) {
+    baseline = (float)mean;
+    noiseStd = (float)sqrt(M2 / (double)(n - 1));
+  } else {
+    baseline = 0.0f;
+    noiseStd = 5.0f;
+  }
+
+  emaDiff = baseline;
+  computeThreshold();
+
+  Serial.println(F("\n== Auto-Calibration Complete =="));
+  Serial.print(F("Samples: ")); Serial.println((uint32_t)n);
+  Serial.print(F("Baseline (diff counts): ")); Serial.println(baseline, 2);
+  Serial.print(F("Noise stdev (counts): ")); Serial.println(noiseStd, 2);
+  Serial.print(F("Threshold (counts): ")); Serial.println(thresh);
+  Serial.println(F("================================\n"));
+}
+
+// -------------------- ARDUINO LIFECYCLE --------------------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  pinMode(IR_LED_PIN, OUTPUT);
+  digitalWrite(IR_LED_PIN, LOW);
+
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  digitalWrite(STATUS_LED_PIN, LOW);
+
+  // Configure ADC
+  analogReadResolution(ADC_BITS);
+  analogSetAttenuation(ADC_ATTEN);
+  // If you want a specific pin attenuation (ESP32), you can also call:
+  // analogSetPinAttenuation(SENSOR_PIN, ADC_ATTEN);
+
+  Serial.println(F("\nIR Phototransistor (Direct) with LED chopping"));
+  Serial.println(F("Calibrating... keep the beam path clear (no bubbles/objects)\n"));
+
+  autoCalibrate();
+}
+
+void loop() {
+  // 1) Read ambient-cancelled signal
+  int16_t diff = readDifferenced();
+
+  // 2) Smooth for readability / stability (doesn't affect raw thresholding)
+  emaDiff = EMA_ALPHA * diff + (1.0f - EMA_ALPHA) * emaDiff;
+
+  // 3) State machine with hysteresis + debounce
+  uint16_t upper = thresh;
+  int32_t  lower = (int32_t)thresh - (int32_t)HYSTERESIS_COUNTS;
+
+  if (!detected) {
+    if (diff >= (int32_t)upper) {
+      if (++hitCount >= DEBOUNCE_HITS_REQUIRED) {
+        detected = true;
+        hitCount = 0;
+        clearCount = 0;
+        digitalWrite(STATUS_LED_PIN, HIGH);
+        Serial.println(F("DETECTED ↑"));
+      }
+    } else {
+      hitCount = 0;
+    }
+  } else {
+    if (diff <= lower) {
+      if (++clearCount >= DEBOUNCE_CLEAR_REQUIRED) {
+        detected = false;
+        clearCount = 0;
+        hitCount = 0;
+        digitalWrite(STATUS_LED_PIN, LOW);
+        Serial.println(F("CLEARED ↓"));
+      }
+    } else {
+      clearCount = 0;
+    }
+  }
+
+  // 4) Periodic telemetry
+  static uint32_t lastPrint = 0;
+  uint32_t now = millis();
+  if (now - lastPrint >= 100) {
+    lastPrint = now;
+    Serial.print(F("diff="));   Serial.print(diff);
+    Serial.print(F("  ema="));  Serial.print(emaDiff, 1);
+    Serial.print(F("  base=")); Serial.print(baseline, 1);
+    Serial.print(F("  thr="));  Serial.print(thresh);
+    Serial.print(F("  state="));Serial.println(detected ? F("ON") : F("OFF"));
+  }
+
+  delay(LOOP_PERIOD_MS);
+}
